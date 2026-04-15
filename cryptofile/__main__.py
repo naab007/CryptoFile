@@ -35,7 +35,29 @@ from . import __version__, batch, crypto, file_ops, gui, shell_integration
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = sys.argv[1:] if argv is None else argv
+    """Top-level entry. Wrapping the whole dispatch in try/except so a
+    silent crash in the frozen ``--windowed`` exe can never vanish — the
+    user sees a messagebox with the exception instead of a silently-closing
+    process that looks like "no dialog appeared"."""
+    try:
+        return _main_impl(sys.argv[1:] if argv is None else argv)
+    except BaseException as e:  # noqa: BLE001 — final safety net
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            messagebox.showerror(
+                "CryptoFile — unexpected error",
+                f"{type(e).__name__}: {e}\n\n{tb[-1200:]}",
+            )
+        except Exception:
+            # If even tk can't show a dialog (e.g. the exception was tk
+            # failing to initialize), fall back to stderr so `cryptofile.exe`
+            # run from cmd.exe still surfaces *something*.
+            print(tb, file=sys.stderr)
+        return 1
+
+
+def _main_impl(args: list[str]) -> int:
     if not args or args[0] in ("settings", "--settings", "-s"):
         return _run_settings()
     if len(args) < 2:

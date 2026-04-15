@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.3 (2026-04-15)
+
+### Bug fix
+- **Password dialog invisible when invoked from the right-click shell verb.** `PasswordDialog` is called transient to a withdrawn dummy root — a configuration that, on several Windows versions, causes the Toplevel to inherit the hidden parent's state and land either behind Explorer or off-screen entirely. Symptom from the user's point of view: click "Encrypt with CryptoFile", nothing happens.
+
+  Fix: two layers.
+  1. `ask_password` no longer uses `withdraw()` — it creates a 1x1 transparent, borderless, off-screen dummy root instead. `Toplevel.transient(parent)` now targets a real window and renders normally.
+  2. `PasswordDialog` on construction runs `attributes("-topmost", True)` + `lift()` + `focus_force()`, then releases topmost 150 ms later. Forces the dialog to the foreground when the exe is launched from a shell verb that left focus with Explorer.
+
+- **Silent crashes in the frozen `--windowed` exe now produce a visible error messagebox.** Previously an unhandled exception anywhere in dispatch vanished (stderr unreachable in --windowed mode). `main()` is now wrapped in a try/except that catches every exception, renders a messagebox with type + message + last 1200 chars of traceback, and falls back to stderr only if tkinter itself can't show a dialog.
+
+No changes to encryption, file I/O, batch coordinator, or wire format.
+
 ## 1.0.2 (2026-04-15)
 
 ### Bug fix

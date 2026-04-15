@@ -9,7 +9,7 @@
 ; Build with:  ISCC.exe installer.iss   (produces dist/CryptoFile-Setup-<ver>.exe)
 
 #define AppName         "CryptoFile"
-#define AppVersion      "1.0.2"
+#define AppVersion      "1.0.3"
 #define AppPublisher    "naab007"
 #define AppURL          "https://github.com/naab007/CryptoFile"
 #define ExeName         "CryptoFile.exe"
@@ -55,7 +55,15 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 ; The PyInstaller onefile build output. Must exist before ISCC runs.
-Source: "dist\{#ExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; Uses dist-release/ so builds work even when the user has the current
+; installed CryptoFile.exe running (the file lock prevents rebuilding
+; over dist/). See feedback_pyinstaller_locked_exe.md.
+#ifexist "dist-release\CryptoFile.exe"
+  #define ExeSource "dist-release\CryptoFile.exe"
+#else
+  #define ExeSource "dist\CryptoFile.exe"
+#endif
+Source: "{#ExeSource}"; DestDir: "{app}"; DestName: "{#ExeName}"; Flags: ignoreversion
 ; Optional: ship the docs alongside so users can find them offline.
 Source: "README.md";     DestDir: "{app}"; Flags: ignoreversion
 Source: "CHANGELOG.md";  DestDir: "{app}"; Flags: ignoreversion

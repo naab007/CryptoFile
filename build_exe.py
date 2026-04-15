@@ -8,6 +8,7 @@ Produces ``dist\\CryptoFile.exe`` (console-less; a tkinter-based GUI).
 """
 from __future__ import annotations
 
+import os
 import PyInstaller.__main__
 from pathlib import Path
 
@@ -27,7 +28,10 @@ def build() -> None:
         "--clean",
         "--noconfirm",
         "--specpath", str(ROOT / "build"),
-        "--distpath", str(ROOT / "dist"),
+        # Use dist-release if a running instance locks dist/CryptoFile.exe
+        # (see feedback_pyinstaller_locked_exe.md). Override with
+        # CRYPTOFILE_DIST env var for one-off builds.
+        "--distpath", os.environ.get("CRYPTOFILE_DIST", str(ROOT / "dist")),
         "--workpath", str(ROOT / "build" / "work"),
         # Hidden imports that PyInstaller's static analysis sometimes misses.
         "--hidden-import", "argon2.low_level",

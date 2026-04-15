@@ -81,7 +81,25 @@ class PasswordDialog(tk.Toplevel):
 
         self.bind("<Return>", lambda _e: self._ok())
         self.bind("<Escape>", lambda _e: self._cancel())
-        self.after(50, lambda: (self.lift(), self.e_pw.focus_force()))
+        # Force this dialog to the foreground. When the exe is launched from
+        # a Windows Explorer shell verb (right-click → Encrypt with CryptoFile)
+        # the invoking Explorer window retains focus and our dialog lands
+        # behind it — indistinguishable from "no dialog appeared". Toggle
+        # -topmost briefly to force foreground, then release so the dialog
+        # doesn't stay pinned above other windows forever.
+        self.after(50, self._force_foreground)
+
+    def _force_foreground(self) -> None:
+        try:
+            self.attributes("-topmost", True)
+            self.lift()
+            self.focus_force()
+            self.e_pw.focus_force()
+            self.after(150, lambda: self.attributes("-topmost", False))
+        except tk.TclError:
+            # If the window has been destroyed (user cancelled very fast),
+            # ignore — nothing to focus.
+            pass
 
     def _toggle_show(self) -> None:
         show = "" if self.v_show.get() else "•"
@@ -118,12 +136,25 @@ class PasswordDialog(tk.Toplevel):
 
 
 def ask_password(mode: str, filename: str, parent: tk.Misc | None = None) -> Optional[str]:
-    """Convenience wrapper. Creates an invisible root if no parent is given."""
+    """Show the password dialog modally and return the entered password (or None).
+
+    Creates a hidden parent root if none is supplied. The root is placed
+    off-screen rather than `withdraw()`-ed, because ``Toplevel.transient()``
+    on a withdrawn root has been observed to make the Toplevel itself
+    invisible / taskbar-absent on some Windows versions when the exe is
+    launched from a shell verb (right-click → Encrypt with CryptoFile).
+    """
     owner = parent
     dummy_root = None
     if owner is None:
         dummy_root = tk.Tk()
-        dummy_root.withdraw()
+        # Positioned off-screen + 1x1 size so it doesn't flash visibly, but
+        # stays a "real" window that the Toplevel can legitimately be
+        # transient to. `.withdraw()` hid it more cleanly but also hid the
+        # dialog on some Win11 / fractional-scaling setups.
+        dummy_root.geometry("1x1+-2000+-2000")
+        dummy_root.overrideredirect(True)
+        dummy_root.attributes("-alpha", 0.0)
         owner = dummy_root
     dlg = PasswordDialog(owner, mode=mode, filename=filename)
     owner.wait_window(dlg)
