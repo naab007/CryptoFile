@@ -1,0 +1,35 @@
+"""PyInstaller driver — build a single-file CryptoFile.exe.
+
+Run from the project root with the venv's pyinstaller::
+
+    .venv\\Scripts\\pyinstaller.exe build_exe.py
+
+Produces ``dist\\CryptoFile.exe`` (console-less; a tkinter-based GUI).
+"""
+from __future__ import annotations
+
+import PyInstaller.__main__
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+
+def build() -> None:
+    PyInstaller.__main__.run([
+        str(ROOT / "cryptofile" / "__main__.py"),
+        "--name", "CryptoFile",
+        "--onefile",
+        "--windowed",              # no console window; tk is the UI
+        "--clean",
+        "--noconfirm",
+        "--specpath", str(ROOT / "build"),
+        "--distpath", str(ROOT / "dist"),
+        "--workpath", str(ROOT / "build" / "work"),
+        # Hidden imports that PyInstaller's static analysis sometimes misses.
+        "--hidden-import", "argon2.low_level",
+        "--hidden-import", "cryptography.hazmat.primitives.ciphers.aead",
+    ])
+
+
+if __name__ == "__main__":
+    build()
