@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.5 (2026-04-15)
+
+### Bug fix
+- **Progress window invisible — encryption creates `.partial` but no UI ever appears.** Same root cause as the 1.0.3 password-dialog bug, missed on that fix: `run_with_progress` and `ask_batch_password` still parented their Toplevels to a `withdraw()`-ed dummy `tk.Tk()`. On Windows, `Toplevel.transient(withdrawn_root)` produces a window that inherits the hidden parent's state and renders off-screen or behind Explorer. Worker thread started normally, created `<name>.partial`, ran Argon2id, began writing chunks — user saw nothing because the progress window was invisible. 1.0.3 fixed this for `PasswordDialog` only.
+
+  Fix: `run_with_progress` and `ask_batch_password` now use the same 1x1 off-screen transparent dummy root as `ask_password`. `ProgressWindow` and `BatchProgressWindow` both gained the `_force_foreground` dance (topmost toggle + lift + focus_force for 150 ms) on construction, matching `PasswordDialog`.
+
+No crypto / wire-format changes.
+
 ## 1.0.4 (2026-04-15)
 
 ### Bug fix

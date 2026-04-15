@@ -218,6 +218,20 @@ class ProgressWindow(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
         # Start the main-thread drain loop.
         self.after(80, self._drain)
+        # Same foreground-forcing dance as PasswordDialog — shell verbs leave
+        # focus with Explorer and the Toplevel otherwise lands behind it
+        # (indistinguishable from "no window opened"). CryptoFile 1.0.5 bug:
+        # .partial file appeared but no progress UI was ever visible.
+        self.after(50, self._force_foreground)
+
+    def _force_foreground(self) -> None:
+        try:
+            self.attributes("-topmost", True)
+            self.lift()
+            self.focus_force()
+            self.after(150, lambda: self.attributes("-topmost", False))
+        except tk.TclError:
+            pass
 
     def set_detail(self, text: str) -> None:
         self.lbl_detail.configure(text=text)
@@ -299,8 +313,13 @@ def run_with_progress(
     owner = parent
     dummy_root = None
     if owner is None:
+        # Off-screen transparent 1x1 root (same pattern as ask_password).
+        # .withdraw() causes transient Toplevels to render invisibly on
+        # Windows shell-verb invocations. See CryptoFile 1.0.3 / 1.0.5.
         dummy_root = tk.Tk()
-        dummy_root.withdraw()
+        dummy_root.geometry("1x1+-2000+-2000")
+        dummy_root.overrideredirect(True)
+        dummy_root.attributes("-alpha", 0.0)
         owner = dummy_root
     win = ProgressWindow(owner, title, subtitle)
     result: list[object] = []
@@ -508,7 +527,9 @@ def ask_batch_password(
     dummy_root = None
     if owner is None:
         dummy_root = tk.Tk()
-        dummy_root.withdraw()
+        dummy_root.geometry("1x1+-2000+-2000")
+        dummy_root.overrideredirect(True)
+        dummy_root.attributes("-alpha", 0.0)
         owner = dummy_root
     dlg = BatchPasswordDialog(owner, mode=mode, files=files)
     owner.wait_window(dlg)
@@ -576,6 +597,17 @@ class BatchProgressWindow(tk.Toplevel):
 
         # Launch the drain loop.
         self.after(80, self._drain)
+        # Force foreground — see ProgressWindow for rationale.
+        self.after(50, self._force_foreground)
+
+    def _force_foreground(self) -> None:
+        try:
+            self.attributes("-topmost", True)
+            self.lift()
+            self.focus_force()
+            self.after(150, lambda: self.attributes("-topmost", False))
+        except tk.TclError:
+            pass
 
     # ── Thread-safe entry points for workers ──────────────────────────────
 
