@@ -253,6 +253,26 @@ sensitive (`cryptofile-1.lock` conveys almost nothing).
   launch; a race-condition swap of files in that directory by a
   concurrent attacker-run process is a theoretical attack. Code
   signing + AppLocker would mitigate; out of scope for v1.
+- **Argon2id working buffer may page to the Windows pagefile**
+  (SECURITY_AUDIT_1 I1). argon2-cffi's memory allocator on Windows
+  uses `malloc`; 256 MiB of key material can be paged out while a
+  derivation is in flight. `VirtualLock` would prevent this but is
+  not exposed by the bindings. The salient mitigation is the same
+  one that protects every other volatile artefact on the box:
+  BitLocker. Documented rather than fixed because the fix requires a
+  C shim below our dependency surface and the residual risk — an
+  attacker with a forensic image of the pagefile — is already
+  out-of-scope (they can also read unencrypted plaintext from the
+  same image).
+- **Intermediate `.partial` files are created with `O_EXCL` and mode
+  `0o600`** (SECURITY_AUDIT_1 M3). This closes two gaps: (a) on
+  POSIX the temp file no longer inherits the process umask (was
+  typically `0o644`); (b) `O_EXCL` refuses to overwrite an existing
+  `.partial`, so a concurrent primary or a prior crash's leftover
+  can't be quietly written through. On NTFS the file still inherits
+  the parent directory's ACL — we rely on the user profile
+  directory being the usual destination and assume the user's
+  profile ACL is already correctly restrictive.
 
 ## Summary
 

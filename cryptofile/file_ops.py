@@ -9,7 +9,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
-from . import crypto
+from . import _logging, crypto
+from ._atomic import atomic_write
+
+_log = _logging.get("file_ops")
 
 # Windows-only file attribute. Python's stdlib `stat` module exposes this
 # on all platforms as of 3.12, but the attribute only appears on stat
@@ -184,21 +187,35 @@ def decrypted_name(src: Path) -> Path:
     return src.with_suffix(src.suffix + ".decrypted")
 
 
+# L-new-8 / SECURITY_AUDIT L3 — cap the conflict-resolution loop. An
+# attacker (or unlucky filesystem) that pre-creates ``foo (2).lock`` ..
+# ``foo (N).lock`` can force unbounded stat-spinning. 10_000 is already
+# absurd for a normal user; beyond that we'd rather surface an error
+# than hang the UI forever.
+_NON_CONFLICTING_MAX_ATTEMPTS = 10_000
+
+
 def non_conflicting_name(target: Path) -> Path:
     """If ``target`` exists, return ``target (2)``, ``target (3)``, … first
     name that doesn't exist. We never overwrite existing files — that's
-    data loss waiting to happen."""
+    data loss waiting to happen.
+
+    Raises :class:`FileOpError` after ``_NON_CONFLICTING_MAX_ATTEMPTS``
+    tries so a pathological directory can't DoS the UI.
+    """
     if not target.exists():
         return target
     stem = target.stem
     suffix = target.suffix
     parent = target.parent
-    n = 2
-    while True:
+    for n in range(2, _NON_CONFLICTING_MAX_ATTEMPTS + 2):
         candidate = parent / f"{stem} ({n}){suffix}"
         if not candidate.exists():
             return candidate
-        n += 1
+    raise FileOpError(
+        f"could not find a non-conflicting name for {target.name!r} after "
+        f"{_NON_CONFLICTING_MAX_ATTEMPTS} attempts"
+    )
 
 
 # ── Secure delete ─────────────────────────────────────────────────────────
@@ -219,6 +236,11 @@ def secure_delete(path: Path, passes: int = 1) -> None:
     * **Copy-on-write filesystems** (ReFS, some network shares): the overwrite
       may allocate a new block and orphan the original. Again — FDE is the
       real answer.
+
+    ``passes`` (L-new-3): values > 1 are effectively theatre on all
+    modern media. Kept as a parameter for callers who want to request
+    multiple HDD passes, but the default of 1 is the right answer on
+    SSDs (wear levelling picks different cells) and HDDs alike.
 
     We still do the overwrite because it's cheap, it beats leaving plaintext
     in pagefile slack, and the cost-to-benefit ratio favours trying.
@@ -255,10 +277,29 @@ def secure_delete(path: Path, passes: int = 1) -> None:
             except OSError:
                 pass
     finally:
+        # BUG_HUNT_10 M4 — on a locked file (AV mid-scan, a handle held
+        # by another process) unlink may fail even after we've already
+        # overwritten. The plaintext bytes are GONE from disk at this
+        # point; the directory entry may linger for a few seconds but
+        # it points at random bytes. Log and continue rather than
+        # raising — raising here turns a secure-delete-succeeded into
+        # a user-visible error.
         try:
             path.unlink()
         except OSError as e:
-            raise FileOpError(f"could not unlink {path}: {e}") from e
+            _log.warning(
+                "secure_delete: overwrite succeeded but unlink failed for %s: %s",
+                _logging.safe_name(path), e,
+            )
+            # Re-raise as FileOpError only if the file still contains
+            # bytes (we didn't even get to overwrite). Size == 0 means
+            # the plaintext is already gone and the dentry will be
+            # reaped by the OS.
+            try:
+                if path.exists() and path.stat().st_size > 0:
+                    raise FileOpError(f"could not unlink {path}: {e}") from e
+            except OSError:
+                pass
 
 
 # ── High-level encrypt / decrypt ──────────────────────────────────────────
@@ -286,28 +327,17 @@ def encrypt_file(
         raise FileOpError(f"not a file: {src}")
     size = src.stat().st_size
     final_out = non_conflicting_name(encrypted_name(src))
+    _log.info("encrypt_file start name=%s size=%d", _logging.safe_name(src), size)
     # Temp file in same directory so the final rename is atomic (same-volume).
-    tmp_out = final_out.with_name(final_out.name + ".partial")
-    try:
-        with open(src, "rb") as fin, open(tmp_out, "wb") as fout:
-            crypto.encrypt_stream(fin, fout, password, size, progress, cancel_check)
-            fout.flush()
-            try:
-                os.fsync(fout.fileno())
-            except OSError:
-                pass
-        os.replace(tmp_out, final_out)
-    except BaseException:
-        # Clean up on any failure — including KeyboardInterrupt.
-        if tmp_out.exists():
-            try:
-                tmp_out.unlink()
-            except OSError:
-                pass
-        raise
+    # ``atomic_write`` creates with O_EXCL + 0o600 (SECURITY_AUDIT M3) and
+    # cleans up the .partial on ANY exception path, including os.replace
+    # failures after the ``with`` block exits (BUG_HUNT_10 M-new-3).
+    with open(src, "rb") as fin, atomic_write(final_out) as (fout, _tmp):
+        crypto.encrypt_stream(fin, fout, password, size, progress, cancel_check)
 
     if delete_source:
         secure_delete(src)
+    _log.info("encrypt_file done name=%s", _logging.safe_name(src))
     return final_out
 
 
@@ -328,29 +358,22 @@ def decrypt_file(
     if not src.is_file():
         raise FileOpError(f"not a file: {src}")
     final_out = non_conflicting_name(decrypted_name(src))
-    tmp_out = final_out.with_name(final_out.name + ".partial")
-    try:
-        with open(src, "rb") as fin, open(tmp_out, "wb") as fout:
-            crypto.decrypt_stream(fin, fout, password, progress, cancel_check)
-            fout.flush()
-            try:
-                os.fsync(fout.fileno())
-            except OSError:
-                pass
-        os.replace(tmp_out, final_out)
-    except BaseException:
-        if tmp_out.exists():
-            try:
-                tmp_out.unlink()
-            except OSError:
-                pass
-        raise
+    _log.info("decrypt_file start name=%s", _logging.safe_name(src))
+    # Same atomic-write pattern as encrypt_file; handles BUG_HUNT_10 M-new-3
+    # and SECURITY_AUDIT M3 in one place.
+    with open(src, "rb") as fin, atomic_write(final_out) as (fout, _tmp):
+        crypto.decrypt_stream(fin, fout, password, progress, cancel_check)
 
     if delete_source:
-        # The encrypted file doesn't need a "secure" overwrite — it's
-        # already ciphertext — but a plain unlink reuses the same code path.
+        # SECURITY_AUDIT L5 — the encrypted file is already ciphertext, so
+        # bit-recovery from free-space alone doesn't expose plaintext. But
+        # a future attacker who later learns the password could combine
+        # recovered ciphertext + password to reconstruct plaintext. One
+        # random overwrite pass closes that window at the cost of a little
+        # I/O. Full-disk encryption remains the real defense.
         try:
-            src.unlink()
-        except OSError as e:
+            secure_delete(src)
+        except FileOpError as e:
             raise FileOpError(f"could not remove encrypted source: {e}") from e
+    _log.info("decrypt_file done name=%s", _logging.safe_name(src))
     return final_out

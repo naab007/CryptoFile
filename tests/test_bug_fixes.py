@@ -240,9 +240,15 @@ def test_m3_coordinator_rejects_path_with_null_byte(tmp_path: Path, monkeypatch)
         # handler must not crash.
         import json
         import socket as _sock
-        port = int(primary.port_path.read_text())
+        # Port-file format (1.0.7+): "<port>:<token_hex>"
+        content = primary.port_path.read_text().strip()
+        port_s, token = content.split(":", 1)
+        port = int(port_s)
         with _sock.create_connection(("127.0.0.1", port)) as s:
-            s.sendall(json.dumps({"path": "evil\x00path.txt"}).encode() + b"\n")
+            s.sendall(
+                json.dumps({"path": "evil\x00path.txt", "token": token}).encode()
+                + b"\n"
+            )
         # Give the handler a moment to process and (hopefully) not crash.
         time.sleep(0.1)
         paths = primary.wait_for_collection(timeout_ms=200, idle_ms=100)

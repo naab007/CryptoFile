@@ -9,7 +9,7 @@
 ; Build with:  ISCC.exe installer.iss   (produces dist/CryptoFile-Setup-<ver>.exe)
 
 #define AppName         "CryptoFile"
-#define AppVersion      "1.0.6"
+#define AppVersion      "1.0.7"
 #define AppPublisher    "naab007"
 #define AppURL          "https://github.com/naab007/CryptoFile"
 #define ExeName         "CryptoFile.exe"
@@ -101,9 +101,27 @@ Type: filesandordirs; Name: "{localappdata}\CryptoFile"
 
 [Code]
 // Pre-install check: refuse to install if the target exe is already
-// running (our own HKCU shell integration or the Settings window). If we
-// don't, file replacement will fail silently on Windows.
+// running. Windows will queue the file replacement for next reboot and
+// the installer reports success — but the vulnerable binary is still
+// active until the user reboots. That's bad enough for feature drift;
+// for a security hotfix it's a silent regression. SECURITY_AUDIT_1 M4.
 function InitializeSetup(): Boolean;
+var
+  ResultCode: Integer;
 begin
+  // tasklist + find returns 0 if found, 1 if not. SW_HIDE keeps this
+  // invisible to the user.
+  if Exec(ExpandConstant('{cmd}'),
+          '/C tasklist /FI "IMAGENAME eq CryptoFile.exe" /NH | find /I "CryptoFile.exe" > nul',
+          '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    if ResultCode = 0 then
+    begin
+      MsgBox('CryptoFile is currently running. Close all CryptoFile windows (check the system tray and Task Manager) and run the installer again.',
+             mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+  end;
   Result := True;
 end;

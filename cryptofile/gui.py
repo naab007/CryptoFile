@@ -3,10 +3,71 @@ from __future__ import annotations
 
 import threading
 import tkinter as tk
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
+
+
+# ── Shared helpers (R2 refactor) ───────────────────────────────────────────
+
+
+@contextmanager
+def hidden_root() -> Iterator[tk.Tk]:
+    """Yield a 1×1, off-screen, transparent, borderless ``tk.Tk()``.
+
+    Background: ``Toplevel.transient(withdrawn_root)`` has been observed
+    to render the Toplevel invisibly / off-screen on Windows when the
+    exe is launched from a shell verb (right-click → Encrypt). We work
+    around this by keeping the parent root "real" but positioned off
+    screen with zero alpha.
+
+    The four call sites (``ask_password``, ``run_with_progress``,
+    ``ask_batch_password``, ``_run_batch``'s dummy) all share this
+    exact setup; R2 refactor consolidates them here so any future tweak
+    lands in one place.
+    """
+    root = tk.Tk()
+    root.geometry("1x1+-2000+-2000")
+    root.overrideredirect(True)
+    root.attributes("-alpha", 0.0)
+    try:
+        yield root
+    finally:
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+
+
+def _force_window_foreground(win: tk.Toplevel, focus_widget: tk.Misc | None = None) -> None:
+    """Force a Toplevel to the foreground with the topmost-toggle dance.
+
+    Used by PasswordDialog, ProgressWindow, BatchProgressWindow, AND
+    BatchPasswordDialog (M-new-5 — previously only had a weaker
+    lift+focus, no topmost toggle). Shell verbs leave focus with
+    Explorer and the Toplevel otherwise lands behind it.
+    """
+    try:
+        win.attributes("-topmost", True)
+        win.lift()
+        win.focus_force()
+        if focus_widget is not None:
+            try:
+                focus_widget.focus_force()
+            except tk.TclError:
+                pass
+        win.after(150, lambda: _safe_release_topmost(win))
+    except tk.TclError:
+        pass
+
+
+def _safe_release_topmost(win: tk.Toplevel) -> None:
+    try:
+        win.attributes("-topmost", False)
+    except tk.TclError:
+        pass
 
 
 # ── Password dialog ────────────────────────────────────────────────────────
@@ -144,24 +205,16 @@ def ask_password(mode: str, filename: str, parent: tk.Misc | None = None) -> Opt
     invisible / taskbar-absent on some Windows versions when the exe is
     launched from a shell verb (right-click → Encrypt with CryptoFile).
     """
-    owner = parent
-    dummy_root = None
-    if owner is None:
-        dummy_root = tk.Tk()
-        # Positioned off-screen + 1x1 size so it doesn't flash visibly, but
-        # stays a "real" window that the Toplevel can legitimately be
-        # transient to. `.withdraw()` hid it more cleanly but also hid the
-        # dialog on some Win11 / fractional-scaling setups.
-        dummy_root.geometry("1x1+-2000+-2000")
-        dummy_root.overrideredirect(True)
-        dummy_root.attributes("-alpha", 0.0)
-        owner = dummy_root
-    dlg = PasswordDialog(owner, mode=mode, filename=filename)
-    owner.wait_window(dlg)
-    pw = dlg.password
-    if dummy_root is not None:
-        dummy_root.destroy()
-    return pw
+    if parent is not None:
+        dlg = PasswordDialog(parent, mode=mode, filename=filename)
+        parent.wait_window(dlg)
+        return dlg.password
+    # R2 refactor — shared ``hidden_root()`` context manager ensures
+    # every ``ask_*`` call uses the exact same off-screen-root pattern.
+    with hidden_root() as root:
+        dlg = PasswordDialog(root, mode=mode, filename=filename)
+        root.wait_window(dlg)
+        return dlg.password
 
 
 # ── Progress window ───────────────────────────────────────────────────────
@@ -278,6 +331,16 @@ class ProgressWindow(tk.Toplevel):
             except tk.TclError:
                 self._closed = True
                 return
+            except Exception:
+                # L-new-7 — set_progress raising anything other than
+                # TclError would silently kill the drain loop (tk's
+                # mainloop swallows exceptions out of after-callbacks).
+                # Log and continue; we still want the cancel button to
+                # work even if the label update blew up.
+                import logging
+                logging.getLogger("cryptofile.gui").exception(
+                    "ProgressWindow.set_progress raised unexpectedly"
+                )
         try:
             self.after(80, self._drain)
         except tk.TclError:
@@ -310,42 +373,36 @@ def run_with_progress(
     ``set_progress`` / ``cancelled``. Returns ``(result, exception)``; exactly
     one of the two is None.
     """
-    owner = parent
-    dummy_root = None
-    if owner is None:
-        # Off-screen transparent 1x1 root (same pattern as ask_password).
-        # .withdraw() causes transient Toplevels to render invisibly on
-        # Windows shell-verb invocations. See CryptoFile 1.0.3 / 1.0.5.
-        dummy_root = tk.Tk()
-        dummy_root.geometry("1x1+-2000+-2000")
-        dummy_root.overrideredirect(True)
-        dummy_root.attributes("-alpha", 0.0)
-        owner = dummy_root
-    win = ProgressWindow(owner, title, subtitle)
-    result: list[object] = []
-    error: list[BaseException] = []
+    # R2 refactor — use the shared hidden_root() ctxmgr.
+    def _run_with(owner: tk.Misc) -> tuple[Optional[object], Optional[BaseException]]:
+        win = ProgressWindow(owner, title, subtitle)
+        result: list[object] = []
+        error: list[BaseException] = []
 
-    def _target():
-        try:
-            result.append(worker(win))
-        except BaseException as e:  # noqa: BLE001 — surface everything to caller
-            error.append(e)
+        def _target():
+            try:
+                result.append(worker(win))
+            except BaseException as e:  # noqa: BLE001 — surface everything to caller
+                error.append(e)
 
-    thread = threading.Thread(target=_target, daemon=True)
-    thread.start()
+        thread = threading.Thread(target=_target, daemon=True)
+        thread.start()
 
-    def _poll():
-        if thread.is_alive():
-            win.after(80, _poll)
-        else:
-            win.after(50, win.destroy)
+        def _poll():
+            if thread.is_alive():
+                win.after(80, _poll)
+            else:
+                win.after(50, win.destroy)
 
-    win.after(80, _poll)
-    owner.wait_window(win)
-    thread.join(timeout=1.0)  # should already be done
-    if dummy_root is not None:
-        dummy_root.destroy()
-    return (result[0] if result else None, error[0] if error else None)
+        win.after(80, _poll)
+        owner.wait_window(win)
+        thread.join(timeout=1.0)  # should already be done
+        return (result[0] if result else None, error[0] if error else None)
+
+    if parent is not None:
+        return _run_with(parent)
+    with hidden_root() as root:
+        return _run_with(root)
 
 
 # ── Batch UIs (multi-file invocations) ────────────────────────────────────
@@ -374,8 +431,13 @@ class BatchPasswordDialog(tk.Toplevel):
 
     def __init__(self, parent: tk.Misc, mode: str, files: list[Path]) -> None:
         super().__init__(parent)
-        assert mode in ("encrypt", "decrypt")
-        assert len(files) >= 2, "use PasswordDialog for single-file"
+        # L-new-6 — runtime checks, not asserts: ``python -O`` strips
+        # asserts, at which point invalid inputs would render a broken
+        # dialog instead of failing fast.
+        if mode not in ("encrypt", "decrypt"):
+            raise ValueError(f"mode must be 'encrypt' or 'decrypt', got {mode!r}")
+        if len(files) < 2:
+            raise ValueError("BatchPasswordDialog requires >= 2 files; use PasswordDialog for single-file")
         self.title(f"CryptoFile — {'Encrypt' if mode == 'encrypt' else 'Decrypt'} {len(files)} files")
         self.geometry("480x440")
         self.resizable(False, False)
@@ -460,7 +522,11 @@ class BatchPasswordDialog(tk.Toplevel):
 
         self.bind("<Return>", lambda _e: self._ok())
         self.bind("<Escape>", lambda _e: self._cancel())
-        self.after(50, lambda: (self.lift(), self.e_pw.focus_force()))
+        # M-new-5 — full foreground-forcing dance (topmost toggle) so the
+        # batch password dialog is visible on shell-verb launches where
+        # focus stays with Explorer. Earlier versions only did
+        # lift+focus, which is unreliable on Win11.
+        self.after(50, lambda: _force_window_foreground(self, self.e_pw))
 
     def _toggle_show(self) -> None:
         show = "" if self.v_show.get() else "•"
@@ -523,20 +589,14 @@ class BatchPasswordDialog(tk.Toplevel):
 def ask_batch_password(
     mode: str, files: list[Path], parent: tk.Misc | None = None,
 ) -> BatchPasswordResult:
-    owner = parent
-    dummy_root = None
-    if owner is None:
-        dummy_root = tk.Tk()
-        dummy_root.geometry("1x1+-2000+-2000")
-        dummy_root.overrideredirect(True)
-        dummy_root.attributes("-alpha", 0.0)
-        owner = dummy_root
-    dlg = BatchPasswordDialog(owner, mode=mode, files=files)
-    owner.wait_window(dlg)
-    result = dlg.result or BatchPasswordResult(None, False, True)
-    if dummy_root is not None:
-        dummy_root.destroy()
-    return result
+    if parent is not None:
+        dlg = BatchPasswordDialog(parent, mode=mode, files=files)
+        parent.wait_window(dlg)
+        return dlg.result or BatchPasswordResult(None, False, True)
+    with hidden_root() as root:
+        dlg = BatchPasswordDialog(root, mode=mode, files=files)
+        root.wait_window(dlg)
+        return dlg.result or BatchPasswordResult(None, False, True)
 
 
 class BatchProgressWindow(tk.Toplevel):

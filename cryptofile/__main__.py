@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-from . import __version__, batch, crypto, file_ops, gui, shell_integration
+from . import __version__, _logging, batch, crypto, file_ops, gui, shell_integration
 
 
 # ── Top-level dispatch ────────────────────────────────────────────────────
@@ -39,11 +39,23 @@ def main(argv: list[str] | None = None) -> int:
     silent crash in the frozen ``--windowed`` exe can never vanish — the
     user sees a messagebox with the exception instead of a silently-closing
     process that looks like "no dialog appeared"."""
+    # M-new-1 — install the rotating-file logger before anything else so
+    # the next silent-UI regression leaves a breadcrumb. Fail-soft: if
+    # we can't create the log dir, ``configure`` returns a NullHandler
+    # logger and encryption still works.
+    _logging.configure()
+    log = _logging.get("main")
+    real_argv = sys.argv[1:] if argv is None else argv
+    log.info(
+        "startup version=%s frozen=%s argc=%d",
+        __version__, getattr(sys, "frozen", False), len(real_argv),
+    )
     try:
-        return _main_impl(sys.argv[1:] if argv is None else argv)
+        return _main_impl(real_argv)
     except BaseException as e:  # noqa: BLE001 — final safety net
         import traceback
         tb = traceback.format_exc()
+        log.exception("fatal in main: %s", type(e).__name__)
         try:
             messagebox.showerror(
                 "CryptoFile — unexpected error",
@@ -325,113 +337,110 @@ def _run_batch(action: str, exp: file_ops.Expansion) -> int:
         return 0
     outcomes: list[_FileOutcome] = []
 
-    # Set up one progress window for the whole batch.
-    # Off-screen transparent 1x1 root (NOT .withdraw()) — see gui.py /
-    # feedback_tk_transient_withdraw_windows.md. withdrawn root causes
-    # transient Toplevels to render invisibly on Windows shell-verb launches.
-    dummy_root = tk.Tk()
-    dummy_root.geometry("1x1+-2000+-2000")
-    dummy_root.overrideredirect(True)
-    dummy_root.attributes("-alpha", 0.0)
-    win = gui.BatchProgressWindow(
-        dummy_root,
-        title=f"CryptoFile — {'Encrypting' if action == 'encrypt' else 'Decrypting'} {len(files)} files",
-        total_files=len(files),
-    )
+    # BUG_HUNT_10 H-new-1 — use the shared hidden_root() ctxmgr so
+    # the per-file ``ask_password(parent=...)`` call below receives a
+    # proper off-screen-transparent real root, not a withdrawn one.
+    # Must hold the ctxmgr open for the full batch duration.
+    with gui.hidden_root() as dummy_root:
+        win = gui.BatchProgressWindow(
+            dummy_root,
+            title=f"CryptoFile — {'Encrypting' if action == 'encrypt' else 'Decrypting'} {len(files)} files",
+            total_files=len(files),
+        )
 
-    worker_done = threading.Event()
-    state: dict = {"cur_index": 0, "cur_total": 0}
+        worker_done = threading.Event()
+        state: dict = {"cur_index": 0, "cur_total": 0}
 
-    def _on_progress(done: int, total: int) -> None:
-        state["cur_index"] = done
-        state["cur_total"] = total
-        win.report_progress(done, total)  # thread-safe; drained on main thread
+        def _on_progress(done: int, total: int) -> None:
+            state["cur_index"] = done
+            state["cur_total"] = total
+            win.report_progress(done, total)  # thread-safe; drained on main thread
 
-    def _worker() -> None:
-        for i, fpath in enumerate(files, start=1):
-            if win.cancelled():
-                # Mark remaining files as cancelled and stop.
-                outcomes.append(_FileOutcome(fpath, "cancelled", "User cancelled"))
-                for remaining in files[i:]:
-                    outcomes.append(_FileOutcome(remaining, "cancelled", "User cancelled"))
-                break
-            win.report_file_start(i, fpath.name)
-
-            # Determine the password for this file.
-            if prompt.per_file:
-                # Ask on the Tk thread, block worker until answered.
-                pw_holder: list[str | None] = [None]
-                pw_done = threading.Event()
-
-                def _ask():
-                    pw_holder[0] = gui.ask_password(
-                        mode=action, filename=fpath.name, parent=dummy_root,
-                    )
-                    pw_done.set()
-
-                win.after(0, _ask)
-                pw_done.wait()
-                pw = pw_holder[0]
-                if pw is None:
-                    outcomes.append(_FileOutcome(fpath, "skipped", "User skipped"))
-                    win.report_file_finish()
-                    continue
-            else:
-                pw = prompt.password
-
-            # Run the actual crypto.
-            try:
-                if action == "encrypt":
-                    out = file_ops.encrypt_file(
-                        fpath, pw, progress=_on_progress,
-                        cancel_check=win.cancelled,
-                    )
-                else:
-                    out = file_ops.decrypt_file(
-                        fpath, pw, progress=_on_progress,
-                        cancel_check=win.cancelled,
-                    )
-                outcomes.append(_FileOutcome(fpath, "ok", "", out))
-            except crypto.Cancelled:
-                outcomes.append(_FileOutcome(fpath, "cancelled", "User cancelled"))
-                # Honour the cancel: mark remaining as cancelled and stop.
-                for remaining in files[i:]:
-                    outcomes.append(_FileOutcome(remaining, "cancelled", "User cancelled"))
-                break
-            except crypto.BadPassword:
-                outcomes.append(
-                    _FileOutcome(fpath, "bad_password", "Wrong password or corrupted file"),
-                )
-                # If we used a shared password and it failed on the very first
-                # file, the password is probably wrong for all. Offer to stop.
-                if not prompt.per_file and i == 1 and len(files) > 1:
-                    # Mark remaining as skipped; user decides on the summary.
-                    for remaining in files[1:]:
-                        outcomes.append(
-                            _FileOutcome(
-                                remaining, "skipped",
-                                "Skipped after first-file password failure",
-                            ),
-                        )
+        def _worker() -> None:
+            for i, fpath in enumerate(files, start=1):
+                if win.cancelled():
+                    # Mark remaining files as cancelled and stop.
+                    outcomes.append(_FileOutcome(fpath, "cancelled", "User cancelled"))
+                    for remaining in files[i:]:
+                        outcomes.append(_FileOutcome(remaining, "cancelled", "User cancelled"))
                     break
-            except crypto.BadFormat as e:
-                outcomes.append(_FileOutcome(fpath, "bad_format", str(e)))
-            except (crypto.CryptoError, file_ops.FileOpError) as e:
-                outcomes.append(_FileOutcome(fpath, "error", str(e)))
-            except Exception as e:  # noqa: BLE001
-                outcomes.append(_FileOutcome(fpath, "error", f"{type(e).__name__}: {e}"))
-            win.report_file_finish()
-        worker_done.set()
-        # Close the window on the main thread, not from the worker.
-        # signal_batch_complete is thread-safe — the drain loop sees it
-        # on its next tick and calls win.destroy() on the main thread.
-        win.signal_batch_complete()
+                win.report_file_start(i, fpath.name)
 
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    dummy_root.wait_window(win)
-    worker_done.wait(timeout=5.0)
-    dummy_root.destroy()
+                # Determine the password for this file.
+                if prompt.per_file:
+                    # Ask on the Tk thread, block worker until answered.
+                    pw_holder: list[str | None] = [None]
+                    pw_done = threading.Event()
+
+                    def _ask():
+                        pw_holder[0] = gui.ask_password(
+                            mode=action, filename=fpath.name, parent=dummy_root,
+                        )
+                        pw_done.set()
+
+                    win.after(0, _ask)
+                    pw_done.wait()
+                    pw = pw_holder[0]
+                    if pw is None:
+                        outcomes.append(_FileOutcome(fpath, "skipped", "User skipped"))
+                        win.report_file_finish()
+                        continue
+                else:
+                    pw = prompt.password
+
+                # Run the actual crypto.
+                try:
+                    if action == "encrypt":
+                        out = file_ops.encrypt_file(
+                            fpath, pw, progress=_on_progress,
+                            cancel_check=win.cancelled,
+                        )
+                    else:
+                        out = file_ops.decrypt_file(
+                            fpath, pw, progress=_on_progress,
+                            cancel_check=win.cancelled,
+                        )
+                    outcomes.append(_FileOutcome(fpath, "ok", "", out))
+                except crypto.Cancelled:
+                    outcomes.append(_FileOutcome(fpath, "cancelled", "User cancelled"))
+                    # Honour the cancel: mark remaining as cancelled and stop.
+                    for remaining in files[i:]:
+                        outcomes.append(_FileOutcome(remaining, "cancelled", "User cancelled"))
+                    break
+                except crypto.BadPassword:
+                    outcomes.append(
+                        _FileOutcome(fpath, "bad_password", "Wrong password or corrupted file"),
+                    )
+                    # If we used a shared password and it failed on the very first
+                    # file, the password is probably wrong for all. Offer to stop.
+                    if not prompt.per_file and i == 1 and len(files) > 1:
+                        # Mark remaining as skipped; user decides on the summary.
+                        for remaining in files[1:]:
+                            outcomes.append(
+                                _FileOutcome(
+                                    remaining, "skipped",
+                                    "Skipped after first-file password failure",
+                                ),
+                            )
+                        break
+                except crypto.BadFormat as e:
+                    outcomes.append(_FileOutcome(fpath, "bad_format", str(e)))
+                except (crypto.CryptoError, file_ops.FileOpError) as e:
+                    outcomes.append(_FileOutcome(fpath, "error", str(e)))
+                except Exception as e:  # noqa: BLE001
+                    outcomes.append(_FileOutcome(fpath, "error", f"{type(e).__name__}: {e}"))
+                win.report_file_finish()
+            worker_done.set()
+            # Close the window on the main thread, not from the worker.
+            # signal_batch_complete is thread-safe — the drain loop sees it
+            # on its next tick and calls win.destroy() on the main thread.
+            win.signal_batch_complete()
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        dummy_root.wait_window(win)
+        worker_done.wait(timeout=5.0)
+        # hidden_root() ctxmgr destroys dummy_root on exit.
 
     _show_batch_summary(action, outcomes, exp)
     # Return code: 0 if all ok, 1 if any file errored.

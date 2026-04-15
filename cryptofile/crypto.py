@@ -52,6 +52,7 @@ from __future__ import annotations
 import os
 import secrets
 import struct
+import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Iterator
 
@@ -80,6 +81,24 @@ ARGON2_MEMORY_KIB = 256 * 1024   # 256 MiB
 ARGON2_TIME_COST = 3             # iterations
 ARGON2_PARALLELISM = 4           # lanes
 KEY_SIZE = 32                    # AES-256
+
+# ── Argon2 parameter ceilings (SECURITY_AUDIT_1 H1) ────────────────────────
+# The header carries attacker-chosen KDF cost. Without upper bounds a
+# malicious .lock with ``memory_kib = 0xFFFFFFFF`` would request a 4 TiB
+# Argon2 working set — denial-of-service for the decrypting machine.
+#
+# Ceilings are chosen to leave forward-compat headroom (~8× the 1.0.x
+# shipped default of 256 MiB / 3 / 4) while refusing obviously hostile
+# values. Any file produced by CryptoFile 1.0.0–1.0.6 decrypts cleanly
+# under these caps — the shipped defaults are deep inside the allowed
+# band. PHC / OWASP 2025 recommend ≥19 MiB / ≥2 iterations; we enforce
+# the lower bound too so a zero or degenerate header is rejected early.
+ARGON2_MAX_MEMORY_KIB = 2 * 1024 * 1024   # 2 GiB
+ARGON2_MIN_MEMORY_KIB = 8                 # argon2-cffi's own floor
+ARGON2_MAX_TIME_COST = 32
+ARGON2_MIN_TIME_COST = 1
+ARGON2_MAX_PARALLELISM = 16
+ARGON2_MIN_PARALLELISM = 1
 
 
 # ── Exceptions ─────────────────────────────────────────────────────────────
@@ -154,6 +173,25 @@ class Header:
         # yet, in case we add optional features later.
         memory_kib, time_cost = struct.unpack_from("<II", data, 8)
         parallelism = data[16]
+        # SECURITY_AUDIT_1 H1 — reject attacker-controlled Argon2 cost
+        # that would DoS the machine. The shipped defaults (256 MiB /
+        # 3 / 4) are well inside these bounds, so every file produced
+        # by 1.0.0–1.0.6 still decrypts under 1.0.7.
+        if not (ARGON2_MIN_MEMORY_KIB <= memory_kib <= ARGON2_MAX_MEMORY_KIB):
+            raise BadFormat(
+                f"memory_kib out of range: {memory_kib} "
+                f"(allowed {ARGON2_MIN_MEMORY_KIB}..{ARGON2_MAX_MEMORY_KIB})"
+            )
+        if not (ARGON2_MIN_TIME_COST <= time_cost <= ARGON2_MAX_TIME_COST):
+            raise BadFormat(
+                f"time_cost out of range: {time_cost} "
+                f"(allowed {ARGON2_MIN_TIME_COST}..{ARGON2_MAX_TIME_COST})"
+            )
+        if not (ARGON2_MIN_PARALLELISM <= parallelism <= ARGON2_MAX_PARALLELISM):
+            raise BadFormat(
+                f"parallelism out of range: {parallelism} "
+                f"(allowed {ARGON2_MIN_PARALLELISM}..{ARGON2_MAX_PARALLELISM})"
+            )
         salt = data[20:36]
         base_nonce = data[36:44]
         (plaintext_size,) = struct.unpack_from("<Q", data, 44)
@@ -177,8 +215,17 @@ def derive_key(password: str, header: Header) -> bytes:
     """
     if not isinstance(password, str):
         raise TypeError("password must be a string")
+    # SECURITY_AUDIT_1 M2 — NFC-normalize before UTF-8 encoding. Two
+    # passwords that render identically can have different byte forms
+    # (composed vs decomposed: "café" is 5 or 6 bytes depending on IME).
+    # Without normalization a user who types the same password on a
+    # different device gets a different Argon2 key and sees "wrong
+    # password". NFC is UAX #15's Security Considerations recommendation
+    # and is idempotent for every Latin-only password. Applied to BOTH
+    # encrypt and decrypt paths (this single function is the only caller).
+    normalized = unicodedata.normalize("NFC", password)
     return hash_secret_raw(
-        secret=password.encode("utf-8"),
+        secret=normalized.encode("utf-8"),
         salt=header.salt,
         time_cost=header.time_cost,
         memory_cost=header.memory_kib,
@@ -352,6 +399,12 @@ def decrypt_stream(
         except Exception as e:
             # cryptography raises InvalidTag — convert so callers don't have
             # to import from the library directly.
+            # L-new-2 / M1: on chunk 0 we report BadPassword even for a
+            # tampered-ciphertext-byte case. This is *intentional*: GCM
+            # can't distinguish the two without side-channel leakage, and
+            # the standard AEAD guidance (UX-neutral failure mode) is to
+            # report a single "wrong password or corrupted file" to the
+            # user. Documented in docs/PROTOCOL.md §Decrypt error mapping.
             if chunk_index == 0:
                 raise BadPassword("wrong password or corrupted file") from e
             raise CryptoError(

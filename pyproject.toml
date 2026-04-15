@@ -4,12 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cryptofile"
-version = "1.0.6"
+version = "1.0.7"
 description = "Right-click file encryption for Windows — Argon2id + AES-256-GCM."
 requires-python = ">=3.11"
+# Exact pins for the shipped PyInstaller build — supply-chain hygiene. A
+# future release that wants to widen these should run `pip install --upgrade`
+# in the venv, re-run the test suite, and bump these to match
+# `pip freeze`. See SECURITY_AUDIT_1.md M6 and CHANGELOG 1.0.7.
 dependencies = [
-    "cryptography>=42.0.0",
-    "argon2-cffi>=23.1.0",
+    "cryptography==46.0.7",
+    "argon2-cffi==25.1.0",
+    "argon2-cffi-bindings==25.1.0",
+    "cffi==2.0.0",
+    "pycparser==3.0",
 ]
 
 [project.optional-dependencies]

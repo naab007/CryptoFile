@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import socket
 import sys
 import threading
@@ -43,10 +44,18 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import _logging
+
 if sys.platform == "win32":
     import msvcrt
 else:
     import fcntl
+
+_log = _logging.get("batch")
+
+# Auth-token length (SECURITY_AUDIT_1 H2). 32 bytes → 64 hex chars; same
+# entropy class as a TLS session cookie. Rotated on every new primary.
+_TOKEN_BYTES = 32
 
 
 ACTIONS = ("encrypt", "decrypt")
@@ -86,6 +95,12 @@ class BatchCoordinator:
         self._paths: list[Path] = []
         self._paths_lock = threading.Lock()
         self._last_arrival = 0.0
+        # SECURITY_AUDIT_1 H2 — per-session auth token. Written to the
+        # port file so only readers of that file (= same user, since it
+        # lives under %LOCALAPPDATA%\CryptoFile\ which is per-user) can
+        # connect. Rotated on every start_server() so a crashed primary
+        # can't leave a replay window open for the next one.
+        self._token: str = ""
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -126,10 +141,26 @@ class BatchCoordinator:
         s.settimeout(0.1)  # accept() wakes every 100 ms so we can observe _stop
         self._server_sock = s
 
-        # Atomic port-file publish so secondaries never read a half-written number.
+        # Rotate the auth token for this session (SECURITY_AUDIT_1 H2).
+        self._token = secrets.token_hex(_TOKEN_BYTES)
+
+        # M-new-4 — prime the idle clock from server-start time so a
+        # caller that forgets to add_local_path() doesn't return
+        # early with an empty list on the very first wait tick.
+        self._last_arrival = time.monotonic()
+
+        # Atomic port-file publish so secondaries never read a half-written
+        # value. Format: ``<port>:<token_hex>\n``. The token is not a
+        # secret in the crypto sense — it's a tamper-evident handle that
+        # proves the connector can read our per-user file. A malicious
+        # process running as a DIFFERENT local user can't read the token
+        # (file lives under %LOCALAPPDATA%\CryptoFile\, per-user).
         tmp = self.port_path.with_name(self.port_path.name + ".tmp")
-        tmp.write_text(str(port), encoding="utf-8")
+        tmp.write_text(f"{port}:{self._token}", encoding="utf-8")
         os.replace(tmp, self.port_path)
+        _log.info(
+            "coordinator primary start action=%s port=%d", self.action, port,
+        )
 
         self._server_thread = threading.Thread(
             target=self._accept_loop, name=f"cryptofile-{self.action}-accept",
@@ -140,6 +171,7 @@ class BatchCoordinator:
 
     def close(self) -> None:
         """Release server + lock + delete coordinator files. Idempotent."""
+        _log.info("coordinator close action=%s", self.action)
         self._stop.set()
         if self._server_sock is not None:
             try:
@@ -199,10 +231,23 @@ class BatchCoordinator:
                     break
                 buf.extend(chunk)
                 if len(buf) > 65536:
-                    return  # refuse oversize (no response — secondary will time out)
+                    _log.warning("coordinator: oversize message rejected")
+                    return  # refuse oversize (no response — secondary times out)
             try:
                 msg = json.loads(buf.decode("utf-8").strip() or "{}")
             except json.JSONDecodeError:
+                _log.warning("coordinator: non-JSON message rejected")
+                return
+            # SECURITY_AUDIT_1 H2 — require the per-session auth token.
+            # A different-user process on the same box can't read our
+            # per-user port file, so it can't learn this token.
+            token = msg.get("token")
+            if not isinstance(token, str) or not secrets.compare_digest(
+                token, self._token,
+            ):
+                _log.warning(
+                    "coordinator: auth-token mismatch, connection dropped",
+                )
                 return
             raw = msg.get("path")
             if not isinstance(raw, str):
@@ -262,22 +307,34 @@ class BatchCoordinator:
 
     def send_to_primary(self, path: Path, timeout_s: float = 2.0) -> bool:
         """Connect to primary's port and send our path. Returns True on success,
-        False if the primary's port file is missing or unreachable."""
+        False if the primary's port file is missing or unreachable.
+
+        Presents the per-session auth token from the port file
+        (SECURITY_AUDIT_1 H2). If the file is in legacy ``<port>`` format
+        (pre-1.0.7, shouldn't happen in practice since both ends upgrade
+        together) we fall through to a tokenless attempt which the new
+        primary will reject — secondary falls back to standalone.
+        """
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             if not self.port_path.exists():
                 time.sleep(0.05)
                 continue
             try:
-                port = int(self.port_path.read_text(encoding="utf-8").strip())
+                content = self.port_path.read_text(encoding="utf-8").strip()
+                if ":" in content:
+                    port_s, token = content.split(":", 1)
+                else:
+                    # Legacy format or corruption — no token available.
+                    port_s, token = content, ""
+                port = int(port_s)
             except (OSError, ValueError):
                 time.sleep(0.05)
                 continue
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=1.0) as s:
-                    s.sendall(
-                        json.dumps({"path": str(path)}).encode("utf-8") + b"\n"
-                    )
+                    payload = {"path": str(path), "token": token}
+                    s.sendall(json.dumps(payload).encode("utf-8") + b"\n")
                 return True
             except OSError:
                 time.sleep(0.05)

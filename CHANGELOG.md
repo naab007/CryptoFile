@@ -1,5 +1,157 @@
 # Changelog
 
+## 1.0.7 (2026-04-15)
+
+Security and bug-hunt hotfix. Addresses every in-scope finding from
+`SECURITY_AUDIT_1.md` (2H / 6M / 7L) and `BUG_HUNT_10.md` (3H / 7M / 8L).
+Wire format unchanged — files encrypted with 1.0.0–1.0.6 decrypt cleanly.
+
+### Security — High
+
+- **H1 — Argon2 header parameters were unbounded.** `Header.from_bytes`
+  accepted any `memory_kib` / `time_cost` / `parallelism` the file
+  declared. A hostile 52-byte header could request 4 TiB of RAM or
+  2^32 passes and wedge the process before the password even
+  mattered.
+  Fix: `crypto.py` adds `ARGON2_{MIN,MAX}_{MEMORY_KIB,TIME_COST,PARALLELISM}`
+  constants and `Header.from_bytes` raises `BadFormat` with the
+  violating parameter named. Shipped defaults (256 MiB / 3 / 4) fit
+  inside the window. (`cryptofile/crypto.py:Header.from_bytes`)
+
+- **H2 — Batch coordinator had no auth.** Any process on the box that
+  could open `127.0.0.1:<port>` could inject arbitrary paths into
+  the primary's encrypt/decrypt queue — cross-user on shared Windows
+  hosts.
+  Fix: `batch.py` generates `secrets.token_hex(32)` per primary
+  session, writes `"<port>:<token>"` to the port file (already 0o600
+  on Windows because it's under the user profile), and every payload
+  must include the token; `secrets.compare_digest` gates the handler.
+  Tokens rotate across primary sessions so a stale token from a
+  crashed primary can't replay. (`cryptofile/batch.py:start_server`,
+  `_handle_connection`, `send_to_primary`)
+
+### Security — Medium
+
+- **M2 — Password not NFC-normalised.** Users who typed `café` on one
+  IME (composed `U+00E9`) and on another (`e` + combining acute
+  `U+0301`) got different AES keys from the same glyph. Lockout with
+  no error feedback.
+  Fix: `crypto.derive_key` calls `unicodedata.normalize("NFC", password)`
+  before UTF-8 encoding. Backwards compatible because prior versions
+  almost always saw the NFC form (Windows IMEs default to composed).
+  (`cryptofile/crypto.py:derive_key`)
+
+- **M3 — `.partial` inherited umask perms.** On POSIX the temp file
+  sat at 0o644 until `os.replace`; on NTFS it inherited the parent
+  directory's ACL. For a secret-bearing intermediate that's one roll
+  of the dice too many.
+  Fix: new `cryptofile/_atomic.py` opens `.partial` with
+  `O_WRONLY|O_CREAT|O_EXCL|O_BINARY` at mode `0o600`. Also refuses to
+  overwrite a pre-existing `.partial` (squatter defence).
+  (`cryptofile/_atomic.py:atomic_write`, callers in
+  `cryptofile/file_ops.py:encrypt_file,decrypt_file`)
+
+- **M4 — Installer silently "succeeded" while the running exe was
+  locked.** Windows queued the replacement for next reboot; ARP said
+  1.0.7, the active process was still the vulnerable build.
+  Fix: `installer.iss` adds `InitializeSetup()` that runs
+  `tasklist /FI "IMAGENAME eq CryptoFile.exe"` and aborts with a
+  messagebox if found. (`installer.iss:InitializeSetup`)
+
+### Bug-hunt — High
+
+- **H-new-3 — `shell_integration._write_verb` computed the icon path
+  with `_shell_exe_path().split('"')[1]` plus a second call to
+  `_shell_exe_path()`, both of which went wrong on unquoted paths
+  containing a stray quote.**
+  Fix: single call + explicit `_extract_exe_path()` helper that
+  handles quoted and unquoted forms.
+  (`cryptofile/shell_integration.py:_write_verb,_extract_exe_path`)
+
+### Bug-hunt — Medium
+
+- **M-new-3 — `.partial` leaked when `os.replace` failed.** The
+  cleanup block lived inside the `with` context, so any exception
+  from rename (AV lock on destination, concurrent run) left the
+  temp file behind.
+  Fix: cleanup moved to the outer `except` branch in
+  `_atomic.atomic_write`. Regression test patches `os.replace` and
+  asserts `list(tmp_path.glob("*.partial")) == []`.
+  (`cryptofile/_atomic.py:atomic_write`)
+
+- **M-new-4 — `wait_for_collection` idle clock started at zero.**
+  A caller who forgot `add_local_path()` saw the idle window return
+  immediately.
+  Fix: `start_server` primes `self._last_arrival = time.monotonic()`.
+  (`cryptofile/batch.py:start_server`)
+
+- **M-new-1 — No persistent logs.** Silent-UI regressions like 1.0.3
+  through 1.0.6 were diagnosed by guesswork because nothing survived
+  the process.
+  Fix: new `cryptofile/_logging.py` installs a `RotatingFileHandler`
+  under `%LOCALAPPDATA%\CryptoFile\logs\cryptofile.log` (5 MiB x 3
+  backups, lazy-created). No full paths written — only `safe_name()`
+  basenames. Fails soft to `NullHandler` if the log dir can't be
+  created. Wired from `__main__.main()`.
+
+- **M-new-5 — Batch password dialog rendered behind Explorer.**
+  Fix: `BatchPasswordDialog` calls `_force_window_foreground(self,
+  self.e_pw)` 50 ms after construction — same dance used by
+  `PasswordDialog` since 1.0.3. (`cryptofile/gui.py`)
+
+- **M4 (bug-hunt) — `secure_delete` raised on transient unlink
+  failures even when the file had already been zeroed.** Lost the
+  secure-delete semantics for retryable errors.
+  Fix: log the failure, only raise `FileOpError` if the file still
+  has bytes on disk. (`cryptofile/file_ops.py:secure_delete`)
+
+### Bug-hunt — Low
+
+- **L-new-2 — Ambiguous `BadPassword` at chunk-0.** Added a clarifying
+  comment so future readers don't "fix" it into leaking which chunk
+  failed. (`cryptofile/crypto.py`)
+
+- **L-new-4 — `shell_integration._delete_tree` caught only
+  `FileNotFoundError`.** A DACL-restricted key aborted the whole
+  uninstall and left stranded verbs.
+  Fix: also catch bare `OSError` on `OpenKey` and `DeleteKey`.
+  (`cryptofile/shell_integration.py:_delete_tree`)
+
+- **L-new-6 — `BatchPasswordDialog` used `assert`.** Asserts compile
+  out under `-O`, leaving the dialog to NPE on bad input.
+  Fix: replace with explicit `ValueError` raises.
+  (`cryptofile/gui.py:BatchPasswordDialog.__init__`)
+
+- **L-new-7 — `ProgressWindow._drain` swallowed every exception
+  including the progress-update itself.** Debugging blind.
+  Fix: narrow the `except` to the set-progress call and log the
+  exception via `logging.getLogger("cryptofile.gui")`.
+  (`cryptofile/gui.py:ProgressWindow._drain`)
+
+- **L-new-8 — `non_conflicting_name` looped unboundedly.** Hostile
+  directory with N siblings made the function O(N).
+  Fix: cap at `_NON_CONFLICTING_MAX_ATTEMPTS = 10_000`; raise
+  `FileOpError` past the cap.
+  (`cryptofile/file_ops.py:non_conflicting_name`)
+
+### Observations (no code change)
+
+- **I1 (SECURITY_AUDIT) — Argon2 working buffer may page to swap.**
+  Noted in `docs/SECURITY.md`; documented as a known limitation of
+  argon2-cffi under Windows.
+
+### Tests
+
+24 new regression tests in `tests/test_security_1_0_7.py` covering
+H1 (six parameter-ceiling cases + defaults + boundary), H2 (token
+presence, wrong-token rejection, tokenless rejection, accept on
+correct token, rotation, end-to-end), M2 (NFC equivalence +
+roundtrip across forms), M3 / M-new-3 (O_EXCL refusal, cleanup on
+replace failure, cleanup on body exception, end-to-end
+`encrypt_file` with flaky `os.replace`), L-new-8 (bounded +
+capped), M-new-4 (primed idle clock). Total: 80 passing, 2
+POSIX-only skips.
+
 ## 1.0.6 (2026-04-15)
 
 ### Bug fix

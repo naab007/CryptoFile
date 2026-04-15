@@ -191,7 +191,12 @@ def _write_verb(parent_subkey: str, verb: str, label: str, command: str) -> None
         winreg.SetValueEx(k, "MUIVerb", 0, winreg.REG_SZ, label)
         # Icon alongside the verb so menu entries get a lock glyph when the
         # exe has one. Falls back gracefully if the index doesn't exist.
-        icon_src = _shell_exe_path().split('"')[1] if '"' in _shell_exe_path() else _shell_exe_path()
+        # BUG_HUNT_10 H-new-3 — single call to _shell_exe_path() plus
+        # explicit helper for extraction. The previous one-liner called
+        # _shell_exe_path() twice AND used split('"')[1] which raises
+        # IndexError on an unquoted path containing a stray quote.
+        raw_exe = _shell_exe_path()
+        icon_src = _extract_exe_path(raw_exe) or raw_exe
         winreg.SetValueEx(k, "Icon", 0, winreg.REG_SZ, f'"{icon_src}",0')
     # Command subkey: default value = command line
     with winreg.CreateKey(  # type: ignore[union-attr]
@@ -227,7 +232,14 @@ def uninstall() -> None:
 
 
 def _delete_tree(subkey: str) -> None:
-    """Delete a registry key and all its children under HKCU. No-op if absent."""
+    """Delete a registry key and all its children under HKCU. No-op if absent.
+
+    BUG_HUNT_10 L-new-4 — catch the broader ``OSError`` rather than only
+    ``FileNotFoundError``. If another tool re-registered the key with a
+    restrictive DACL (unlikely under HKCU but possible), OpenKey raises
+    ``PermissionError`` (OSError subclass). Leaving uninstall half-done
+    strands the user with a broken shell entry they can't self-fix.
+    """
     try:
         with winreg.OpenKey(  # type: ignore[union-attr]
             winreg.HKEY_CURRENT_USER, subkey, 0, winreg.KEY_ALL_ACCESS,
@@ -242,9 +254,15 @@ def _delete_tree(subkey: str) -> None:
                 _delete_tree(rf"{subkey}\{child}")
     except FileNotFoundError:
         return
+    except OSError:
+        # Access denied or similar — log and move on. uninstall() should
+        # remove what it CAN rather than aborting on the first problem key.
+        return
     try:
         winreg.DeleteKey(winreg.HKEY_CURRENT_USER, subkey)  # type: ignore[union-attr]
     except FileNotFoundError:
+        pass
+    except OSError:
         pass
 
 
