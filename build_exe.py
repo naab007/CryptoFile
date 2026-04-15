@@ -16,7 +16,11 @@ ROOT = Path(__file__).resolve().parent
 
 def build() -> None:
     PyInstaller.__main__.run([
-        str(ROOT / "cryptofile" / "__main__.py"),
+        # Use the top-level run.py shim rather than cryptofile/__main__.py
+        # directly. Entry-script mode strips __package__, breaking every
+        # relative import in the package — the shim imports the package
+        # proper, which preserves them.
+        str(ROOT / "run.py"),
         "--name", "CryptoFile",
         "--onefile",
         "--windowed",              # no console window; tk is the UI

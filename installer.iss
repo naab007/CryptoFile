@@ -9,7 +9,7 @@
 ; Build with:  ISCC.exe installer.iss   (produces dist/CryptoFile-Setup-<ver>.exe)
 
 #define AppName         "CryptoFile"
-#define AppVersion      "1.0.1"
+#define AppVersion      "1.0.2"
 #define AppPublisher    "naab007"
 #define AppURL          "https://github.com/naab007/CryptoFile"
 #define ExeName         "CryptoFile.exe"

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.2 (2026-04-15)
+
+### Bug fix
+- **Frozen exe crashed at startup with `ImportError: attempted relative import with no known parent package`.** PyInstaller was pointed at `cryptofile/__main__.py` directly; in that mode the entry script has no `__package__`, so every `from . import …` fails. The 1.0.1 smoke test caught this only when run via `python -m cryptofile` (which sets the package context) — the frozen exe path was never exercised end-to-end.
+
+  Fix: added a top-level `run.py` shim that does `from cryptofile.__main__ import main`. `build_exe.py` now points at `run.py`; `cryptofile/` is imported as a proper package, and relative imports resolve correctly at runtime.
+
+No code-level changes to the encryption, file handling, batch coordinator, or GUI — only the PyInstaller entry-point plumbing.
+
 ## 1.0.1 (2026-04-15)
 
 Post-audit hardening + proper installer. No user-facing API changes; wire
