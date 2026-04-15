@@ -33,8 +33,14 @@ def build() -> None:
         # CRYPTOFILE_DIST env var for one-off builds.
         "--distpath", os.environ.get("CRYPTOFILE_DIST", str(ROOT / "dist")),
         "--workpath", str(ROOT / "build" / "work"),
-        # Hidden imports that PyInstaller's static analysis sometimes misses.
-        "--hidden-import", "argon2.low_level",
+        # argon2-cffi is a cffi package — PyInstaller's static analysis can
+        # miss both the top-level `argon2` package and the generated cffi
+        # extension module. --collect-all bundles the whole package tree
+        # plus data files. Previously we only listed `argon2.low_level` as
+        # a hidden import; 1.0.5 rebuild dropped the top-level `argon2`
+        # and the frozen exe crashed with `ModuleNotFoundError: No module
+        # named 'argon2'` at startup.
+        "--collect-all", "argon2",
         "--hidden-import", "cryptography.hazmat.primitives.ciphers.aead",
     ])
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.6 (2026-04-15)
+
+### Bug fix
+- **Frozen exe crashed at startup: `ModuleNotFoundError: No module named 'argon2'`.** The 1.0.5 build was done with system Python (via `python build_exe.py` in bash) instead of the venv Python. System Python had PyInstaller installed but not `argon2-cffi`, so PyInstaller's static analysis produced an exe with no `argon2` package bundled. 1.0.1–1.0.4 had worked because earlier builds happened to go through the venv.
+
+  Fix (two layers):
+  1. `build_exe.py` now uses `--collect-all argon2` instead of only `--hidden-import argon2.low_level`. `argon2-cffi` is a cffi package — `--collect-all` pulls the whole package tree plus the generated binary extension and data files, immune to which Python invocation runs the build.
+  2. All future builds must go through `.venv/Scripts/python.exe build_exe.py`, not bare `python`.
+
+No crypto / wire-format changes. The 1.0.5 release artifacts were broken at startup; 1.0.6 supersedes them.
+
+- **Batch path (`__main__._run_batch`) still used `dummy_root.withdraw()`** for the per-batch dummy root after 1.0.5's fix. Result: multi-file right-click → batch progress window invisible (same bug as 1.0.5, just on the batch path). Now uses the same 1x1 off-screen transparent root.
+
 ## 1.0.5 (2026-04-15)
 
 ### Bug fix

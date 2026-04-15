@@ -326,8 +326,13 @@ def _run_batch(action: str, exp: file_ops.Expansion) -> int:
     outcomes: list[_FileOutcome] = []
 
     # Set up one progress window for the whole batch.
+    # Off-screen transparent 1x1 root (NOT .withdraw()) — see gui.py /
+    # feedback_tk_transient_withdraw_windows.md. withdrawn root causes
+    # transient Toplevels to render invisibly on Windows shell-verb launches.
     dummy_root = tk.Tk()
-    dummy_root.withdraw()
+    dummy_root.geometry("1x1+-2000+-2000")
+    dummy_root.overrideredirect(True)
+    dummy_root.attributes("-alpha", 0.0)
     win = gui.BatchProgressWindow(
         dummy_root,
         title=f"CryptoFile — {'Encrypting' if action == 'encrypt' else 'Decrypting'} {len(files)} files",
