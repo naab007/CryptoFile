@@ -263,7 +263,7 @@ def _run_encrypt(path: Path) -> int:
         subtitle=f"Encrypting {path.name}",
         worker=lambda pw_win: file_ops.encrypt_file(
             path, pw,
-            progress=lambda d, t: pw_win.after(0, pw_win.set_progress, d, t),
+            progress=pw_win.report_progress,   # thread-safe; no cross-thread tk
             cancel_check=pw_win.cancelled,
         ),
     )
@@ -292,7 +292,7 @@ def _run_decrypt(path: Path) -> int:
         subtitle=f"Decrypting {path.name}",
         worker=lambda pw_win: file_ops.decrypt_file(
             path, pw,
-            progress=lambda d, t: pw_win.after(0, pw_win.set_progress, d, t),
+            progress=pw_win.report_progress,   # thread-safe; no cross-thread tk
             cancel_check=pw_win.cancelled,
         ),
     )
@@ -340,7 +340,7 @@ def _run_batch(action: str, exp: file_ops.Expansion) -> int:
     def _on_progress(done: int, total: int) -> None:
         state["cur_index"] = done
         state["cur_total"] = total
-        win.after(0, win.set_progress, done, total)
+        win.report_progress(done, total)  # thread-safe; drained on main thread
 
     def _worker() -> None:
         for i, fpath in enumerate(files, start=1):
@@ -350,7 +350,7 @@ def _run_batch(action: str, exp: file_ops.Expansion) -> int:
                 for remaining in files[i:]:
                     outcomes.append(_FileOutcome(remaining, "cancelled", "User cancelled"))
                 break
-            win.after(0, win.start_file, i, fpath.name)
+            win.report_file_start(i, fpath.name)
 
             # Determine the password for this file.
             if prompt.per_file:
@@ -369,7 +369,7 @@ def _run_batch(action: str, exp: file_ops.Expansion) -> int:
                 pw = pw_holder[0]
                 if pw is None:
                     outcomes.append(_FileOutcome(fpath, "skipped", "User skipped"))
-                    win.after(0, win.finish_file)
+                    win.report_file_finish()
                     continue
             else:
                 pw = prompt.password
@@ -415,9 +415,12 @@ def _run_batch(action: str, exp: file_ops.Expansion) -> int:
                 outcomes.append(_FileOutcome(fpath, "error", str(e)))
             except Exception as e:  # noqa: BLE001
                 outcomes.append(_FileOutcome(fpath, "error", f"{type(e).__name__}: {e}"))
-            win.after(0, win.finish_file)
+            win.report_file_finish()
         worker_done.set()
-        win.after(50, win.destroy)
+        # Close the window on the main thread, not from the worker.
+        # signal_batch_complete is thread-safe — the drain loop sees it
+        # on its next tick and calls win.destroy() on the main thread.
+        win.signal_batch_complete()
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()

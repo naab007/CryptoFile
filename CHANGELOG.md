@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.4 (2026-04-15)
+
+### Bug fix
+- **`RuntimeError: main thread is not in main loop`** when encrypting. Workers were calling `pw_win.after(0, pw_win.set_progress, …)` to marshal progress back to the main thread. While `.after()` is documented as thread-safe, in practice on Windows `--windowed` PyInstaller builds it can raise this error intermittently. Before 1.0.3, the error vanished silently; 1.0.3's new top-level try/except surfaced it as a messagebox.
+
+  Fix: `ProgressWindow` and `BatchProgressWindow` now have thread-safe `report_progress()` / `report_file_start()` / `report_file_finish()` / `signal_batch_complete()` methods that write to locked state. The main thread runs a self-scheduled `_drain` loop every 80 ms that reads the state and updates the UI. Workers no longer call ANY tk method directly — eliminates the entire class of "main thread is not in main loop" failures for the common paths (single-file encrypt/decrypt, batch progress).
+
+- The per-file-password batch path still uses `win.after(0, _ask)` to open a password dialog from the worker thread. That's the rare path (user ticks "Use a different password for each file" in the batch dialog). If the same issue hits there, the top-level error messagebox catches it rather than silent exit.
+
+No wire-format / encryption changes.
+
 ## 1.0.3 (2026-04-15)
 
 ### Bug fix

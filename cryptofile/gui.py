@@ -168,10 +168,19 @@ def ask_password(mode: str, filename: str, parent: tk.Misc | None = None) -> Opt
 
 
 class ProgressWindow(tk.Toplevel):
-    """Indeterminate-capable progress window used during the long operations
-    (Argon2 KDF, large-file I/O). The work runs on a worker thread; we poll
-    the result every 80 ms and pump the mainloop in between so the UI stays
-    responsive."""
+    """Progress window for long operations (Argon2 KDF + file I/O).
+
+    Threading model: ``report_progress()`` and ``cancelled()`` are both
+    thread-safe — workers call them directly without going through tk.
+    The UI update happens on the main thread via a self-scheduled
+    ``_drain`` loop that reads a locked snapshot of the progress state.
+
+    Why not just ``pw_win.after(0, pw_win.set_progress, ...)``?
+    `after()` from a non-main thread is documented as safe but has been
+    observed to raise "main thread is not in main loop" intermittently
+    in frozen `--windowed` PyInstaller builds on Windows (CryptoFile
+    1.0.3 bug). Polling avoids it entirely.
+    """
 
     def __init__(self, parent: tk.Misc, title: str, subtitle: str) -> None:
         super().__init__(parent)
@@ -181,6 +190,13 @@ class ProgressWindow(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
         self._cancel = threading.Event()
+
+        # Thread-shared progress state — writes under lock; reads in _drain.
+        self._p_done = 0
+        self._p_total = 0
+        self._p_dirty = False
+        self._p_lock = threading.Lock()
+        self._closed = False
 
         frame = ttk.Frame(self, padding=18)
         frame.pack(fill="both", expand=True)
@@ -200,11 +216,14 @@ class ProgressWindow(tk.Toplevel):
         ttk.Button(btns, text="Cancel", command=self._on_cancel).grid(row=0, column=1)
 
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        # Start the main-thread drain loop.
+        self.after(80, self._drain)
 
     def set_detail(self, text: str) -> None:
         self.lbl_detail.configure(text=text)
 
     def set_progress(self, done: int, total: int) -> None:
+        """Main-thread only. Workers should call ``report_progress`` instead."""
         if total <= 0:
             self.bar.configure(mode="indeterminate")
             self.bar.step(2)
@@ -213,12 +232,46 @@ class ProgressWindow(tk.Toplevel):
         self.bar.configure(mode="determinate", value=pct)
         self.lbl_detail.configure(text=f"{_fmt_bytes(done)} / {_fmt_bytes(total)}  ({pct:.1f}%)")
 
+    def report_progress(self, done: int, total: int) -> None:
+        """Thread-safe. Call from any thread — the main-thread drain loop
+        picks up the new values and calls ``set_progress`` on the next tick."""
+        with self._p_lock:
+            self._p_done = done
+            self._p_total = total
+            self._p_dirty = True
+
     def cancelled(self) -> bool:
         return self._cancel.is_set()
 
     def _on_cancel(self) -> None:
         self._cancel.set()
-        self.lbl_detail.configure(text="Cancelling…")
+        try:
+            self.lbl_detail.configure(text="Cancelling…")
+        except tk.TclError:
+            pass
+
+    def _drain(self) -> None:
+        if self._closed:
+            return
+        with self._p_lock:
+            dirty = self._p_dirty
+            d, t = self._p_done, self._p_total
+            if dirty:
+                self._p_dirty = False
+        if dirty:
+            try:
+                self.set_progress(d, t)
+            except tk.TclError:
+                self._closed = True
+                return
+        try:
+            self.after(80, self._drain)
+        except tk.TclError:
+            self._closed = True
+
+    def destroy(self) -> None:  # type: ignore[override]
+        self._closed = True
+        super().destroy()
 
 
 def _fmt_bytes(n: int) -> str:
@@ -478,6 +531,20 @@ class BatchProgressWindow(tk.Toplevel):
         self._cancel = threading.Event()
         self._total_files = total_files
 
+        # Thread-shared state for the main-thread drain loop. See
+        # ProgressWindow's docstring for why we poll instead of calling
+        # `.after(0, ...)` from worker threads.
+        self._state_lock = threading.Lock()
+        self._state_dirty = False
+        self._state_file_index = 1
+        self._state_file_name = ""
+        self._state_file_started = False
+        self._state_file_finished = False
+        self._state_p_done = 0
+        self._state_p_total = 0
+        self._should_close = False
+        self._closed = False
+
         frame = ttk.Frame(self, padding=18)
         frame.pack(fill="both", expand=True)
 
@@ -507,6 +574,90 @@ class BatchProgressWindow(tk.Toplevel):
         ttk.Button(btns, text="Cancel", command=self._on_cancel).grid(row=0, column=1)
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
+        # Launch the drain loop.
+        self.after(80, self._drain)
+
+    # ── Thread-safe entry points for workers ──────────────────────────────
+
+    def report_file_start(self, index_1_based: int, filename: str) -> None:
+        """Thread-safe. Worker calls when it begins processing a new file."""
+        with self._state_lock:
+            self._state_file_index = index_1_based
+            self._state_file_name = filename
+            self._state_file_started = True
+            self._state_p_done = 0
+            self._state_p_total = 0
+            self._state_dirty = True
+
+    def report_progress(self, done: int, total: int) -> None:
+        """Thread-safe. Worker calls for byte-level progress within a file."""
+        with self._state_lock:
+            self._state_p_done = done
+            self._state_p_total = total
+            self._state_dirty = True
+
+    def report_file_finish(self) -> None:
+        """Thread-safe. Worker calls when it finishes a file (success or skip)."""
+        with self._state_lock:
+            self._state_file_finished = True
+            self._state_dirty = True
+
+    def signal_batch_complete(self) -> None:
+        """Thread-safe. Worker calls once after the whole batch is done
+        (success, cancel, or error). The drain loop sees this on its next
+        tick and destroys the window on the main thread — avoids calling
+        `win.destroy()` or `win.after(…, win.destroy)` from the worker,
+        either of which can raise "main thread is not in main loop"."""
+        with self._state_lock:
+            self._should_close = True
+            self._state_dirty = True
+
+    # ── Main-thread drain loop ────────────────────────────────────────────
+
+    def _drain(self) -> None:
+        if self._closed:
+            return
+        with self._state_lock:
+            dirty = self._state_dirty
+            idx = self._state_file_index
+            name = self._state_file_name
+            started = self._state_file_started
+            finished = self._state_file_finished
+            should_close = self._should_close
+            d, t = self._state_p_done, self._state_p_total
+            if dirty:
+                self._state_dirty = False
+                self._state_file_started = False
+                self._state_file_finished = False
+        if dirty:
+            try:
+                if started:
+                    self.start_file(idx, name)
+                if t > 0 or d > 0:
+                    self.set_progress(d, t)
+                if finished:
+                    self.finish_file()
+            except tk.TclError:
+                self._closed = True
+                return
+        if should_close:
+            self._closed = True
+            try:
+                self.destroy()
+            except tk.TclError:
+                pass
+            return
+        try:
+            self.after(80, self._drain)
+        except tk.TclError:
+            self._closed = True
+
+    def destroy(self) -> None:  # type: ignore[override]
+        self._closed = True
+        super().destroy()
+
+    # ── Main-thread UI primitives (workers should call report_* instead) ──
+
     def start_file(self, index_1_based: int, filename: str) -> None:
         self.lbl_overall.configure(
             text=f"File {index_1_based} of {self._total_files}",
@@ -535,5 +686,8 @@ class BatchProgressWindow(tk.Toplevel):
 
     def _on_cancel(self) -> None:
         self._cancel.set()
-        self.lbl_detail.configure(text="Cancelling after current file…")
+        try:
+            self.lbl_detail.configure(text="Cancelling after current file…")
+        except tk.TclError:
+            pass
 
