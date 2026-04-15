@@ -42,6 +42,25 @@ def main(argv: list[str] | None = None) -> int:
         return _run_settings()
 
     cmd = args[0]
+
+    # Silent shell-registration modes used by the installer's [Run] /
+    # [UninstallRun] sections. Exit codes: 0 success, 1 failure.
+    if cmd == "install-shell":
+        try:
+            shell_integration.install()
+            return 0
+        except Exception as e:
+            # Write to stderr so the installer's log captures the reason.
+            print(f"install-shell failed: {e}", file=sys.stderr)
+            return 1
+    if cmd == "uninstall-shell":
+        try:
+            shell_integration.uninstall()
+            return 0
+        except Exception as e:
+            print(f"uninstall-shell failed: {e}", file=sys.stderr)
+            return 1
+
     target = Path(args[1]).expanduser()
 
     if cmd in ("encrypt", "--encrypt", "-e"):

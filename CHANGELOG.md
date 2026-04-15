@@ -2,7 +2,21 @@
 
 ## 1.0.1 (2026-04-15)
 
-Post-audit hardening. No user-facing API changes; wire format unchanged.
+Post-audit hardening + proper installer. No user-facing API changes; wire
+format unchanged.
+
+### Installer (new)
+
+- **`CryptoFile-Setup-1.0.1.exe`** — Inno Setup-based installer (16.7 MB).
+  Installs per-user (no admin) to `%LOCALAPPDATA%\Programs\CryptoFile\`,
+  registers the right-click context-menu verbs automatically (both file
+  and folder variants), creates a Start Menu entry, and writes an
+  Add/Remove Programs entry for one-click uninstall from Windows
+  Settings. Source: `installer.iss` at the repo root.
+- **New `install-shell` / `uninstall-shell` CLI modes** on
+  `CryptoFile.exe` — used by the installer's `[Run]` and `[UninstallRun]`
+  sections to register/unregister shell verbs silently. Exit code 0 on
+  success, 1 on failure.
 
 ### Fixed
 

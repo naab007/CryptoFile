@@ -17,16 +17,25 @@ Right-click the encrypted output to decrypt it.
   (see the caveats in [`docs/SECURITY.md`](docs/SECURITY.md)).
 - No admin required — everything registers under `HKCU`.
 
+## How to install
+
+**Recommended — installer**: download `CryptoFile-Setup-<version>.exe` from
+the [Releases page](https://github.com/naab007/CryptoFile/releases) and
+run it. No admin required (per-user install under
+`%LOCALAPPDATA%\Programs\CryptoFile`). The installer registers the
+right-click menu entries automatically and adds an Add/Remove Programs
+entry so uninstallation is one click from Windows Settings.
+
+**Portable** (advanced): download `CryptoFile.exe` directly, run it
+once, click **Install** in the Settings window to register the
+right-click entries.
+
 ## How to use
 
-1. Run `CryptoFile.exe` once — the Settings window opens.
-2. Click **Install** to register the right-click menu entries.
-3. In Explorer, right-click a file or folder → **Encrypt with CryptoFile**
+1. In Explorer, right-click a file or folder → **Encrypt with CryptoFile**
    → enter a password → done.
-4. To decrypt: right-click the `.lock` file (or the folder containing them)
+2. To decrypt: right-click the `.lock` file (or the folder containing them)
    → **Decrypt with CryptoFile**.
-
-Uninstall from the same Settings window.
 
 ## Highlights
 
